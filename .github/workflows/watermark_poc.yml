@@ -1,0 +1,243 @@
+# PoC 工作流：验证「GitHub Actions 能不能当打标机」
+#
+# 两种模式（自动判断，不用你选）：
+#   A. worker 模式：Worker 已部署 → 从 Worker 领任务（QQ / 母本 / R2 地址都由 Worker 给）
+#   B. direct 模式：Worker 没部署 → 用 inputs.poc_qqs 里写死的假号跑一本，只验 numpy/Pillow 与计时
+#
+# 要测的三件事：
+#   1) 从点击到"能跑代码"到底多久（t_ready）—— 这个数决定产品能不能"当场等"
+#   2) numpy/Pillow + 现成引擎在公共 runner 上能不能跑通
+#   3) 产出怎么进 R2、映射怎么回调 Worker
+#
+# ⚠️ inputs 会显示在 Actions 页面与日志里：**生产绝不能把 QQ/密钥放进 inputs**；
+#    这里 poc_qqs 只是 PoC 的假号（1234500xx），真实名单必须走 Worker 领任务。
+#
+# ⚠️⚠️ 这个文件必须能被 GitHub 解析成合法 YAML，否则 dispatch 直接 422，
+#      报错却是 "Workflow does not have 'workflow_dispatch' trigger"（极具误导）。
+#      **不要在 `run: |` 里贴顶格（第 0 列）的 heredoc 正文** —— 那就是上次 422 的真因。
+#      本文件所有 shell 段落一律缩进；需要跑 Python 时调用 poc/ 下的脚本。
+#
+# 🧪 simulate = 故障注入开关（QA《异步架构专项预案》§3.3 场景 B 要求的能力）：
+#    none          正常跑
+#    crash_before  领到任务后、跑引擎前 exit 1      → 验证 queued 任务永不卡死
+#    crash_after   引擎跑完、回调前 exit 1          → 验证 running 任务靠看门狗收敛
+#    no_callback   跑完但故意不回调（网络断）        → 同上
+#    turso_fail    回调照发，但 Worker 侧写库失败    → 验证 CONS-002「done 但映射缺失」
+#  Worker 只在 env.ALLOW_INJECT=1 时才会把 simulate 塞进 inputs；生产不设这个变量就没有注入面。
+
+name: watermark-poc
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_id:
+        description: "批次 id（Worker 生成；direct 模式随便填）"
+        required: true
+        default: "poc-0001"
+      cb:
+        description: "回调令牌（Worker 签发；direct 模式留空）"
+        required: false
+        default: ""
+      worker:
+        description: "Worker 基址（留空 = direct 模式）"
+        required: false
+        default: ""
+      poc_qqs:
+        description: "【仅 PoC】direct 模式用的假 QQ，逗号分隔"
+        required: false
+        default: "123450001"
+      simulate:
+        description: "【仅测试】故障注入：none / crash_before / crash_after / no_callback / turso_fail"
+        required: false
+        default: "none"
+        type: choice
+        options:
+          - none
+          - crash_before
+          - crash_after
+          - no_callback
+          - turso_fail
+
+concurrency:
+  group: wm-poc-${{ inputs.batch_id }}
+  cancel-in-progress: false
+
+jobs:
+  embed:
+    runs-on: ubuntu-latest          # public 仓库：4 vCPU / 16 GB，分钟数不限
+    timeout-minutes: 20
+    steps:
+      # ---------- t0 = 容器已分配、开始跑 ----------
+      - name: t0 环境就绪
+        run: |
+          T0=$(date +%s)
+          echo "POC_T0=$T0"
+          echo "T0_JOB_START=$T0" >> "$GITHUB_ENV"
+          echo "POC_SIMULATE=${{ inputs.simulate }}"
+          uname -a
+          nproc
+          free -m | head -2
+
+      - uses: actions/checkout@v4
+
+      # ---------- 定位引擎目录：仓库里可能叫 tool/ 也可能叫 wm-portal/tool/ ----------
+      # 之前这里写死 tool/，而实际仓库结构是 wm-portal/tool/，就算 YAML 修好也会在"准备母本"崩
+      - name: 定位引擎目录
+        run: |
+          set -euo pipefail
+          P=$(find . -path ./.git -prune -o -name generate_and_send.py -print -quit)
+          if [ -z "$P" ]; then
+            echo "::error title=缺引擎::仓库里找不到 generate_and_send.py，需要把 wm-portal/tool 整个提交"
+            exit 1
+          fi
+          D=$(dirname "$P")
+          echo "ENGINE_DIR=$D" >> "$GITHUB_ENV"
+          echo "引擎目录：$D"
+          ls "$D" | head -5 || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # ---------- t1 = 依赖装好（真正能跑引擎的时刻） ----------
+      - name: t1 安装 numpy/Pillow
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "numpy>=1.26,<3" "pillow>=10.4"
+          python -c "import numpy, PIL; print('numpy', numpy.__version__, 'PIL', PIL.__version__)"
+          T0=${T0_JOB_START}
+          T1=$(date +%s)
+          echo "POC_T0=$T0 POC_T1=$T1 POC_INSTALL=$((T1 - T0))"
+          echo "T1_DEPS_READY=$T1" >> "$GITHUB_ENV"
+          echo "- 装依赖：$((T1 - T0)) 秒" >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------- 取活：Worker 优先，失败就回退 direct ----------
+      - name: 领任务
+        env:
+          CB: ${{ inputs.cb }}
+        run: |
+          set -uo pipefail
+          MODE=direct
+          if [ -n "${{ inputs.worker }}" ] && [ -n "$CB" ]; then
+            if curl -sSf -m 20 -X POST "${{ inputs.worker }}/internal/batch/${{ inputs.batch_id }}" \
+                 -H "X-Act-Token: $CB" -H "Content-Type: application/json" -o job.json 2>/dev/null; then
+              if python -c "import json,sys;d=json.load(open('job.json'));sys.exit(0 if d.get('qqs') else 1)" 2>/dev/null; then
+                MODE=worker
+              fi
+            fi
+          fi
+          echo "POC_MODE=$MODE"
+          echo "MODE=$MODE" >> "$GITHUB_ENV"
+          if [ "$MODE" = "worker" ]; then
+            python poc/job_to_env.py job.json >> "$GITHUB_ENV"
+          else
+            echo "（direct 模式：不经过 Worker，用假号跑一本，验证引擎与计时）"
+            # poc_qqs 支持逗号分隔多个（direct 模式仍只跑 1 本，--limit 1 控制）
+            printf 'qq_number,email\n' > qq.csv
+            echo "${{ inputs.poc_qqs }}" | tr ',' '\n' \
+              | awk 'NF { print $0 "," $0 "@qq.com" }' >> qq.csv
+            S=$(python -c "import secrets;print(secrets.token_hex(32))")
+            K=$(python -c "import secrets;print(secrets.token_hex(24))")
+            echo "SERVER_SECRET=$S" >> "$GITHUB_ENV"
+            echo "DB_KEY=$K" >> "$GITHUB_ENV"
+          fi
+          head -3 qq.csv
+
+      # ---------- 母本：worker 模式从 Worker 取，direct 模式用仓库里的 ----------
+      - name: 准备母本
+        run: |
+          set -euo pipefail
+          if [ "${MODE}" = "worker" ]; then
+            curl -sS -L "${MOTHER_URL}" -o /tmp/mother.epub
+          else
+            cp "${ENGINE_DIR}/mother.epub" /tmp/mother.epub
+          fi
+          ls -l /tmp/mother.epub
+
+      # ---------- 故障注入 ①：跑引擎前崩（模拟 runner 半路挂） ----------
+      - name: "注入 crash_before"
+        if: inputs.simulate == 'crash_before'
+        run: |
+          echo "::error title=故障注入::crash_before —— 模拟 runner 在跑引擎前退出（非零码）"
+          echo "期望：批次应保持 running，直到看门狗把它收敛成 failed（不能永远卡住）"
+          exit 1
+
+      # ---------- 跑现成引擎（tool/ 一行不改） ----------
+      - name: 打标（engine 原样调用）
+        run: |
+          set -euo pipefail
+          T2=$(date +%s)
+          python "${ENGINE_DIR}/generate_and_send.py" \
+            --epub /tmp/mother.epub --csv qq.csv --title "PoC" \
+            --dry-run --limit 1 2>&1 | tee run.log
+          T3=$(date +%s)
+          WID=$(grep -oE 'WM-[0-9A-Fa-f]{10}-[0-9A-Fa-f]{6}' run.log | head -1 || true)
+          echo "POC_T2=$T2 POC_T3=$T3 POC_EMBED=$((T3 - T2)) POC_WID=$WID"
+          echo "WID=$WID" >> "$GITHUB_ENV"
+          echo "- 单本打标：$((T3 - T2)) 秒，水印 $WID" >> "$GITHUB_STEP_SUMMARY"
+          ls -l "${ENGINE_DIR}/out" 2>/dev/null | tail -5 || ls -l .
+
+      # ---------- 故障注入 ②：跑完但回调前崩（成品已在，没人报账） ----------
+      - name: "注入 crash_after"
+        if: inputs.simulate == 'crash_after'
+        run: |
+          echo "::error title=故障注入::crash_after —— 引擎已跑完，但在回调前退出"
+          echo "期望：批次停在 running；看门狗 STUCK_MINUTES 后转 failed；R2 可能留半成品（可清理）"
+          exit 1
+
+      # ---------- 成品进 R2（两条路：Worker 给的 URL / 直接用 AWS CLI） ----------
+      - name: 上传成品
+        if: always()
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_AK }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SK }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -uo pipefail
+          # 成品由引擎写到 ${ENGINE_DIR}/out/；母本在 /tmp，所以"比它新"的就是产物
+          F=$(find . -name '*.epub' -newer /tmp/mother.epub -not -path './.git/*' 2>/dev/null | head -1 || true)
+          if [ -z "$F" ]; then
+            echo "没有找到成品，跳过上传"
+            exit 0
+          fi
+          if [ -n "${UPLOAD_URL:-}" ]; then
+            curl -sS -X PUT "$UPLOAD_URL" --upload-file "$F" \
+              -H "Content-Type: application/epub+zip" -w "\nHTTP %{http_code}\n"
+          elif [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${R2_ENDPOINT:-}" ]; then
+            aws --endpoint-url "$R2_ENDPOINT" s3 cp "$F" "s3://$R2_BUCKET/out/${{ inputs.batch_id }}.epub" --only-show-errors
+            echo "已上传 s3://$R2_BUCKET/out/${{ inputs.batch_id }}.epub"
+          else
+            echo "既没有 Worker 上传地址，也没有 R2 密钥 —— 跳过（不影响打标结论）"
+          fi
+
+      # ---------- 回调（只有 worker 模式才需要） ----------
+      - name: 回调 Worker
+        if: always() && inputs.simulate != 'no_callback'
+        run: |
+          set -uo pipefail
+          if [ -z "${{ inputs.worker }}" ] || [ -z "${{ inputs.cb }}" ]; then
+            echo "direct 模式，跳过回调"
+            exit 0
+          fi
+          curl -sS -m 20 -X POST "${{ inputs.worker }}/internal/callback" \
+            -H "X-Act-Token: ${{ inputs.cb }}" -H "Content-Type: application/json" \
+            -d "{\"batch_id\":\"${{ inputs.batch_id }}\",\"status\":\"done\",\"watermark_id\":\"${WID:-}\",\"qq\":\"123450001\",\"simulate\":\"${{ inputs.simulate }}\"}" \
+            -w "\nHTTP %{http_code}\n"
+
+      - name: 跳过回调（注入）
+        if: inputs.simulate == 'no_callback'
+        run: |
+          echo "::warning title=故障注入::no_callback —— 故意不回调，批次会停在 running"
+          echo "期望：看门狗 POST /internal/watchdog 后转 failed"
+
+      - name: 收尾统计
+        if: always()
+        run: |
+          T1=${T1_DEPS_READY:-0}
+          T0=${T0_JOB_START:-0}
+          if [ "$T1" -gt 0 ] && [ "$T0" -gt 0 ]; then
+            echo "### t_ready（点→能跑代码）= $((T1 - T0)) 秒" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "### simulate = ${{ inputs.simulate }}" >> "$GITHUB_STEP_SUMMARY"
