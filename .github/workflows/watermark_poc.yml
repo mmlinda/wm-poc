@@ -1,0 +1,157 @@
+# PoC 工作流：验证「GitHub Actions 能不能当打标机」
+#
+# 两种模式（自动判断，不用你选）：
+#   A. worker 模式：Worker 已部署 → 从 Worker 领任务（QQ / 母本 / R2 地址都由 Worker 给）
+#   B. direct 模式：Worker 没部署 → 用 inputs.poc_qqs 里写死的假号跑一本，只验 numpy/Pillow 与计时
+#
+# 要测的三件事：
+#   1) 从点击到"能跑代码"到底多久（t_ready）—— 这个数决定产品能不能"当场等"
+#   2) numpy/Pillow + 现成引擎在公共 runner 上能不能跑通
+#   3) 产出怎么进 R2、映射怎么回调 Worker
+#
+# ⚠️ inputs 会显示在 Actions 页面与日志里：**生产绝不能把 QQ/密钥放进 inputs**；
+#    这里 poc_qqs 只是 PoC 的假号（1234500xx），真实名单必须走 Worker 领任务。
+
+name: watermark-poc
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_id:
+        description: "批次 id（Worker 生成；direct 模式随便填）"
+        required: true
+        default: "poc-0001"
+      cb:
+        description: "回调令牌（Worker 签发；direct 模式留空）"
+        required: false
+        default: ""
+      worker:
+        description: "Worker 基址（留空 = direct 模式）"
+        required: false
+        default: ""
+      poc_qqs:
+        description: "【仅 PoC】direct 模式用的假 QQ，逗号分隔"
+        required: false
+        default: "123450001"
+
+concurrency:
+  group: wm-poc-${{ inputs.batch_id }}
+  cancel-in-progress: false
+
+jobs:
+  embed:
+    runs-on: ubuntu-latest          # public 仓库：4 vCPU / 16 GB，分钟数不限
+    timeout-minutes: 20
+    steps:
+      # ---------- t0 = 容器已分配、开始跑 ----------
+      - name: t0 环境就绪
+        run: |
+          T0=$(date +%s)
+          echo "POC_T0=$T0"                       # ← 明文打出，PoC 脚本从日志里抓
+          echo "T0_JOB_START=$T0" >> $GITHUB_ENV
+          uname -a; nproc; free -m | head -2
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # ---------- t1 = 依赖装好（真正能跑引擎的时刻） ----------
+      - name: t1 安装 numpy/Pillow
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "numpy>=1.26,<3" "pillow>=10.4"
+          python -c "import numpy, PIL; print('numpy', numpy.__version__, 'PIL', PIL.__version__)"
+          T0=${{ env.T0_JOB_START }}
+          T1=$(date +%s)
+          echo "POC_T0=$T0 POC_T1=$T1 POC_INSTALL=$((T1 - T0))"
+          echo "T1_DEPS_READY=$T1" >> $GITHUB_ENV
+          echo "- 装依赖：$((T1 - T0)) 秒" >> $GITHUB_STEP_SUMMARY
+
+      # ---------- 取活：Worker 优先，失败就回退 direct ----------
+      - name: 领任务
+        env:
+          CB: ${{ inputs.cb }}
+        run: |
+          set -uo pipefail
+          MODE=direct
+          if [ -n "${{ inputs.worker }}" ] && [ -n "$CB" ]; then
+            if curl -sSf -m 20 -X POST "${{ inputs.worker }}/internal/batch/${{ inputs.batch_id }}" \
+                 -H "X-Act-Token: $CB" -H "Content-Type: application/json" -o job.json 2>/dev/null; then
+              if python -c "import json;d=json.load(open('job.json'));assert d.get('qqs')" 2>/dev/null; then
+                MODE=worker
+              fi
+            fi
+          fi
+          echo "POC_MODE=$MODE"
+          if [ "$MODE" = "worker" ]; then
+            python - <<'PY'
+import json
+j = json.load(open("job.json"))
+open("qq.csv", "w", encoding="utf-8-sig").write(
+    "qq_number,email\n" + "\n".join(f"{q},{q}@qq.com" for q in j["qqs"]))
+open("env.sh", "w").write(
+    f'export MOTHER_URL="{j["mother_url"]}"\nexport UPLOAD_URL="{j["upload_url"]}"\n'
+    f'export SERVER_SECRET="{j["creds"]["server_secret"]}"\nexport DB_KEY="{j["creds"]["db_key"]}"\n')
+print("任务数", len(j["qqs"]))
+PY
+            source env.sh
+            curl -sS -L "$MOTHER_URL" -o mother.epub
+          else
+            echo "（direct 模式：不经过 Worker，用假号跑一本，验证引擎与计时）"
+            printf 'qq_number,email\n123450001,123450001@qq.com\n' > qq.csv
+            cp tool/mother.epub mother.epub
+            export SERVER_SECRET=$(python -c "import secrets;print(secrets.token_hex(32))")
+            export DB_KEY=$(python -c "import secrets;print(secrets.token_hex(24))")
+          fi
+          ls -l mother.epub qq.csv
+          echo "MODE=$MODE" >> $GITHUB_ENV
+
+      # ---------- 跑现成引擎（tool/ 一行不改） ----------
+      - name: 打标（engine 原样调用）
+        run: |
+          set -euo pipefail
+          T2=$(date +%s)
+          python tool/generate_and_send.py \
+            --epub mother.epub --csv qq.csv --title "PoC" \
+            --dry-run --limit 1 2>&1 | tee run.log
+          T3=$(date +%s)
+          WID=$(grep -oE 'WM-[0-9A-Fa-f]{10}-[0-9A-Fa-f]{6}' run.log | head -1 || true)
+          echo "POC_T2=$T2 POC_T3=$T3 POC_EMBED=$((T3 - T2)) POC_WID=$WID"
+          echo "WID=$WID" >> $GITHUB_ENV
+          echo "- 单本打标：$((T3 - T2)) 秒，水印 $WID" >> $GITHUB_STEP_SUMMARY
+          ls -l out/ 2>/dev/null || ls -l .
+
+      # ---------- 成品进 R2（两条路：Worker 给的 URL / 直接用 AWS CLI） ----------
+      - name: 上传成品
+        if: always()
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_AK }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SK }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -uo pipefail
+          F=$(find . -name '*.epub' -newer mother.epub 2>/dev/null | head -1 || true)
+          [ -z "$F" ] && { echo "没有找到成品，跳过上传"; exit 0; }
+          if [ -n "${UPLOAD_URL:-}" ]; then
+            curl -sS -X PUT "$UPLOAD_URL" --upload-file "$F" -H "Content-Type: application/epub+zip" -w "\nHTTP %{http_code}\n"
+          elif [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${R2_ENDPOINT:-}" ]; then
+            aws --endpoint-url "$R2_ENDPOINT" s3 cp "$F" "s3://$R2_BUCKET/out/${{ inputs.batch_id }}.epub" --only-show-errors
+            echo "已上传 s3://$R2_BUCKET/out/${{ inputs.batch_id }}.epub"
+          else
+            echo "既没有 Worker 上传地址，也没有 R2 密钥 —— 跳过（不影响打标结论）"
+          fi
+
+      # ---------- 回调（只有 worker 模式才需要） ----------
+      - name: 回调 Worker
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -z "${{ inputs.worker }}" ] || [ -z "${{ inputs.cb }}" ]; then echo "direct 模式，跳过回调"; exit 0; fi
+          curl -sS -m 20 -X POST "${{ inputs.worker }}/internal/callback" \
+            -H "X-Act-Token: ${{ inputs.cb }}" -H "Content-Type: application/json" \
+            -d "{\"batch_id\":\"${{ inputs.batch_id }}\",\"status\":\"done\",\"watermark_id\":\"${WID:-}\",\"qq\":\"123450001\"}" \
+            -w "\nHTTP %{http_code}\n"
