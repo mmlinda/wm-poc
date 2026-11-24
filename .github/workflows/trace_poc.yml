@@ -1,0 +1,89 @@
+name: trace-poc
+
+# 可疑文件溯源：云端解码（7 层，含图片层频域分析）
+#
+# 为什么放 Actions 而不是 Worker：
+#   图片层要 numpy + Pillow 做 DCT / 调色板分析，Cloudflare 的 Python Worker 是
+#   Pyodide，跑不了；Actions 的 ubuntu-latest 自带 CPython + numpy + Pillow。
+#   公开仓库的标准 runner 免费且不限量，所以这条路是零成本的。
+#
+# 触发：Worker 收到"溯源上传"后 dispatch 本工作流，带一次性 trace token。
+# 回调：poc/trace_post.py → POST {worker}/internal/trace/result
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "溯源工单 id"
+        required: true
+      file_url:
+        description: "可疑文件下载地址（带 15 分钟 token）"
+        required: true
+      worker:
+        description: "Worker 根地址，如 https://xiuxiu.0668899.xyz"
+        required: true
+      trace_token:
+        description: "一次性回调 token（scope=trace，绑 job_id）"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  trace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 取私有引擎
+        # 引擎不在公开仓库里：算法、密钥派生、频域实现都在私有仓库 wm-engine。
+        # 公开仓库只保留工作流骨架，fork 的人拿不到 ENGINE_PAT，clone 必然失败。
+        env:
+          ENGINE_PAT: ${{ secrets.ENGINE_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ENGINE_PAT:-}" ]; then
+            echo "::error title=缺 ENGINE_PAT::仓库 Secrets 里没有 ENGINE_PAT，无法拉私有引擎"
+            exit 1
+          fi
+          git clone --depth 1 "https://x-access-token:${ENGINE_PAT}@github.com/mmlinda/wm-engine.git" /tmp/wm-engine
+          mkdir -p wm-portal
+          rm -rf wm-portal/tool
+          cp -r /tmp/wm-engine/tool wm-portal/tool
+          test -f wm-portal/tool/generate_and_send.py
+          echo "引擎已就位：$(ls wm-portal/tool | wc -l) 个文件"
+
+      - name: 装依赖
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet "numpy>=1.26" "pillow>=10.4"
+          python -c "import numpy, PIL; print('numpy', numpy.__version__, 'pillow', PIL.__version__)"
+
+      - name: 下载疑似文件
+        run: |
+          mkdir -p work
+          curl -fsSL -m 900 "${{ inputs.file_url }}" -o work/suspect.epub
+          ls -l work/suspect.epub
+          head -c 2 work/suspect.epub | od -c | head -1
+
+      - name: 解码并回调
+        env:
+          TURSO_URL: ${{ secrets.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
+          POC_SERVER_SECRET: ${{ secrets.POC_SERVER_SECRET }}
+          POC_DB_KEY: ${{ secrets.POC_DB_KEY }}
+          JOB_ID: ${{ inputs.job_id }}
+          TRACE_TOKEN: ${{ inputs.trace_token }}
+          WORKER: ${{ inputs.worker }}
+        run: |
+          set +e
+          python poc/decode_trace.py work/suspect.epub --json > work/out.txt 2> work/err.txt
+          echo "--- stdout tail"
+          tail -5 work/out.txt
+          echo "--- stderr tail"
+          tail -10 work/err.txt
+          python poc/trace_post.py
