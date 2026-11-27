@@ -221,10 +221,10 @@ def main() -> int:
     ap.add_argument("--batch", default="", help="只试某个批次")
     # 零宽层是**铺开到每个正文页**的（embed 时 _zw_pages 全铺），
     # 所以溯源只要扫几页就够命中；多扫只会把"每条记录 × 每页"的代价乘上去。
-    ap.add_argument("--max-pages", type=int, default=6,
-                    help="扫多少页正文（默认 6；水印每页都有，扫多了只是更慢）")
-    ap.add_argument("--max-images", type=int, default=4,
-                    help="扫多少张图（图片层最贵；默认 4）")
+    ap.add_argument("--max-pages", type=int, default=5,
+                    help="扫多少页正文（默认 5；水印每页都有，扫多了只是更慢）")
+    ap.add_argument("--max-images", type=int, default=2,
+                    help="扫多少张图（图片层最贵；默认 2）")
     ap.add_argument("--ls", action="store_true", help="只统计库里有密钥的记录")
     ap.add_argument("--json", action="store_true", help="输出 TRACE_JSON= 一行，给网页回调消费")
     args = ap.parse_args()
