@@ -96,8 +96,11 @@ def fetch_keys(env, batch=""):
     """从 Turso 取所有带密钥的映射记录。"""
     url, tok = norm_turso(env["TURSO_URL"]), env["TURSO_TOKEN"]
     # css_key / lsb_key 必须一起取：缺了它们，CSS 与图片层永远解不出来
-    sql = ("SELECT watermark_id,qq,book_id,batch_id,chaos_seed,chaos_mu,css_key,lsb_key,version_id "
-           "FROM wm_mapping WHERE chaos_seed IS NOT NULL AND chaos_seed != ''")
+    # 带上书名：疑文件里的 dc:title 能先把候选从几百条缩到几本（见 narrow_by_title）
+    sql = ("SELECT m.watermark_id,m.qq,m.book_id,m.batch_id,m.chaos_seed,m.chaos_mu,"
+           "m.css_key,m.lsb_key,m.version_id,IFNULL(b.title,'') AS title "
+           "FROM wm_mapping m LEFT JOIN books b ON b.id=m.book_id "
+           "WHERE m.chaos_seed IS NOT NULL AND m.chaos_seed != ''")
     args = []
     if batch:
         sql += " AND batch_id=?"
@@ -110,6 +113,42 @@ def fetch_keys(env, batch=""):
             for row in r[1].get("rows") or []:
                 rows.append(dict(zip(cols, row)))
     return rows
+
+
+def epub_title(path: str) -> str:
+    """从 OPF 里读 dc:title（不依赖第三方库）。"""
+    import re
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as z:
+            opf = next((n for n in z.namelist() if n.lower().endswith(".opf")), "")
+            if not opf:
+                return ""
+            text = z.read(opf).decode("utf-8", "replace")
+        m = re.search(r"<dc:title[^>]*>(.*?)</dc:title>", text, re.S | re.I)
+        return re.sub(r"<[^>]+>", "", m.group(1)).strip() if m else ""
+    except Exception:                     # noqa: BLE001
+        return ""
+
+
+def _norm(s: str) -> str:
+    import re
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]", "", (s or "").lower())
+
+
+def narrow_by_title(rows, title: str):
+    """按书名把候选密钥缩到"这一本"。
+
+    为什么必须做：每解码一份可疑文件，引擎要把**每条记录的 6 组密钥**都试一遍；
+    库里 80 条记录 = 480 组，实测 2.2 秒/组 → 十几分钟（2026-11-27 真实卡死）。
+    文件名/OPF 里的书名和 books.title 对得上时，候选通常只剩个位数。
+    """
+    t = _norm(title)
+    if not t or len(t) < 2:
+        return rows, 0
+    hit = [r for r in rows if _norm(r.get("title", "")) and
+           (_norm(r.get("title", "")) in t or t in _norm(r.get("title", "")))]
+    return (hit, len(hit)) if hit else (rows, 0)
 
 
 def build_keys_list(rows):
@@ -154,11 +193,38 @@ def build_keys_list(rows):
     return keys_list
 
 
+def mark_running() -> None:
+    """告诉 Worker"我开始解码了"。
+
+    以前只有结束才回调，界面在整段解码期间都显示"排队中"、进度条卡在 92%，
+    运营以为卡死了（2026-11-27 反馈）。这里打个卡，界面就能显示"解码中 + 已用时"。
+    """
+    worker = os.environ.get("WORKER", "").rstrip("/")
+    tok = os.environ.get("TRACE_TOKEN", "")
+    jid = os.environ.get("JOB_ID", "")
+    if not (worker and tok and jid):
+        return
+    try:
+        req = urllib.request.Request(
+            worker + "/internal/trace/progress",
+            data=json.dumps({"job_id": jid}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-Trace-Token": tok,
+                     "User-Agent": "wm-trace/1.0"})
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception:            # noqa: BLE001
+        pass                     # 打卡失败不影响解码
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="可疑 EPUB 溯源（密钥取 Turso）")
     ap.add_argument("epub", nargs="?", default="", help="可疑文件路径")
     ap.add_argument("--batch", default="", help="只试某个批次")
-    ap.add_argument("--max-pages", type=int, default=40)
+    # 零宽层是**铺开到每个正文页**的（embed 时 _zw_pages 全铺），
+    # 所以溯源只要扫几页就够命中；多扫只会把"每条记录 × 每页"的代价乘上去。
+    ap.add_argument("--max-pages", type=int, default=6,
+                    help="扫多少页正文（默认 6；水印每页都有，扫多了只是更慢）")
+    ap.add_argument("--max-images", type=int, default=4,
+                    help="扫多少张图（图片层最贵；默认 4）")
     ap.add_argument("--ls", action="store_true", help="只统计库里有密钥的记录")
     ap.add_argument("--json", action="store_true", help="输出 TRACE_JSON= 一行，给网页回调消费")
     args = ap.parse_args()
@@ -184,6 +250,16 @@ def main() -> int:
         print("库里没有任何带密钥的记录 —— 说明打标时没把密钥回传（历史上确实如此）", file=sys.stderr)
         return 2
 
+    title = epub_title(args.epub)
+    if not args.batch and title:
+        orig_n = len(rows)
+        rows2, kept = narrow_by_title(rows, title)
+        if kept:
+            rows = rows2
+            print("按书名「%s」收窄候选：%d 条记录（原 %d 条）" % (title, kept, orig_n))
+        else:
+            print("书名「%s」在库里没对上，仍按全部 %d 条试" % (title, len(rows)))
+
     keys_list = build_keys_list(rows)
     if not keys_list:
         print("记录里没解析出合法密钥", file=sys.stderr)
@@ -202,7 +278,10 @@ def main() -> int:
     from watermark_embed import extract_watermark       # noqa: E402
 
     print("用 %d 组候选密钥解码…" % len(keys_list))
-    wid, ch = extract_watermark(args.epub, keys_list=keys_list, max_pages=args.max_pages)
+    mark_running()
+    wid, ch = extract_watermark(args.epub, keys_list=keys_list,
+                                max_pages=args.max_pages,
+                                max_images=args.max_images)
 
     # 7 层体检：**没命中也要做**。
     # "抓不到水印"本身需要解释 —— 是本来就没嵌过，还是被对方清干净了？
@@ -216,8 +295,11 @@ def main() -> int:
     rep = None
     if LR is not None:
         try:
+            # 已命中时层体检只做浅扫：完整再扫一遍等于把时间翻倍，
+            # 而命中的层已经由上面那次扫描给出了结论。
             rep = LR.analyze_layers(args.epub, keys_list,
-                                    watermark_id=wid, max_pages=args.max_pages)
+                                    watermark_id=wid,
+                                    max_pages=min(args.max_pages, 4))
         except Exception as e:             # noqa: BLE001
             print("[!] 层体检失败：%s" % e, file=sys.stderr)
 
